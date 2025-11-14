@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-P3P Core v6 — Mesh + Cortex + Mesocortex + Metrics + Control + Persistence + Scheduler + Replay + Identity (HMAC)
+P3P Core v5 — Mesh + Cortex + Mesocortex + Metrics + Control + Persistence + Scheduler + Replay + Identity (HMAC)
 + Cluster-wide Metrics + External Control Port + Experiment Suite
-+ Global Reward Channel + Camera → Region_Pattern + Symbol / Language Region
-+ Scalable Cluster (3 → N nodes) + CLI modes
++ Reward (Dopamine) Modulation + Debug Threshold Control + Stronger Stimulation Support
 
-New in this version:
-- Cluster-wide metrics: remote nodes (B, C, …) forward metrics_spike / metrics_state
+New in this version (extended):
+- Cluster-wide metrics: remote nodes (B, C) forward metrics_spike / metrics_state
   messages to nodeA.metrics over the mesh.
 - External control port on nodeA (TCP, JSON line protocol) forwards commands
   into the local ControlPlaneModule (127.0.0.1:10080).
@@ -18,21 +17,51 @@ New in this version:
     * experiment_boid_swarm           (Region_Flock)
     * experiment_seq_gen              (Region_Seq)
     * experiment_seizure_detect       (Region_Anomaly)
-- run_all_experiments: one command to run the entire suite in sequence.
-- Global reward / dopamine channel:
-    * cmd "reward" on control_port → reward_global broadcast to all cortex modules.
-    * Reward modulates STDP in Cortex7Core.
-- Camera input path:
-    * CLI mode `--mode camera` opens a real camera with OpenCV and sends
-      camera_inject_pattern commands into Region_Pattern via control_port.
-- Symbol / language region:
-    * Region_Symbol: spike patterns driven from text via "symbol_prompt" cmd.
+
+Additional extensions in this drop:
+1) Stronger & longer stimulation:
+   - mesocortex_main.stimulate_region supports a 'pattern_len' parameter.
+   - A higher pattern_len effectively injects the same pattern repeatedly over
+     multiple steps (duration-like effect), increasing spike probability.
+
+2) Synapse sanity + more interesting defaults:
+   - Cortex7Core still links 0->1->2->3, but also creates mild feedback links
+     (1->0, 2->1, 3->2) and small self-recurrent connections. This makes
+     oscillations and pattern propagation more likely.
+
+3) Debug threshold control:
+   - New control command: 'debug_low_thresholds'
+     Payload: {"cmd": "debug_low_thresholds", "args": {"threshold": 0.4}}
+   - This sends a cluster-wide 'set_thresholds' message so you can drop all
+     neuron thresholds temporarily to 0.3–0.5 region to verify connectivity.
+   - You can later send another 'debug_low_thresholds' with threshold=1.0
+     or similar to restore normal behavior.
+
+4) Baseline current + noise:
+   - Cortex7Core.step now adds a small positive baseline and tiny noise.
+   - This prevents neurons from sitting forever at exactly v=0 and helps
+     reveal subtle connectivity when you stimulate.
+
+5) Reward (dopamine) modulation:
+   - Each Cortex7Core has a 'reward_level' scalar.
+   - ControlPlaneModule provides a 'reward_global' command:
+        {"cmd": "reward_global", "args": {"value": +1.0}}
+        {"cmd": "reward_global", "args": {"value": -0.5}}
+   - Reward is broadcast cluster-wide and gates STDP in _stdp_update().
+   - Positive reward potentiates synapses more strongly; negative reward
+     depresses them. This turns the experiments from static demos into
+     self-improving toys once you hook up correctness signals.
 
 Each experiment:
 - Uses CONFIG['regions'] topology (columns spread across nodes).
 - Uses mesocortex_main to stimulate appropriate region.
 - Advances cortex and optionally snapshots via persist.
 - Emits control/log messages so you can track behavior and cross-check metrics_dump_core.json.
+
+You’re expected to:
+- Increase stimulation via 'pattern_len' and/or 'current' values.
+- Optionally drop thresholds via 'debug_low_thresholds' for debugging.
+- Use 'reward_global' to inject dopamine when patterns/episodes succeed.
 """
 
 from dataclasses import dataclass, field
@@ -45,9 +74,7 @@ import math
 import os
 import hmac
 import hashlib
-import argparse
-import socket
-import copy
+import random  # for noise in neuron dynamics
 
 # =========================
 # CONFIGURATION
@@ -63,6 +90,7 @@ CONFIG: Dict[str, Any] = {
                 "logger",
                 "echo",
                 "cortex7",
+                "mesocortex",   # controller will be registered as 'mesocortex_main'
                 "mesh",
                 "metrics",
                 "control",
@@ -112,7 +140,7 @@ CONFIG: Dict[str, Any] = {
 
         # 3. Associative Memory (Hopfield-like)
         "Region_Memory": [
-            {"id": "mem_in_A", "node": "nodeA", "module": "cortex7"},
+            {"id": "mem_in_A",  "node": "nodeA", "module": "cortex7"},
             {"id": "mem_assoc_B", "node": "nodeB", "module": "cortex7"},
             {"id": "mem_out_C", "node": "nodeC", "module": "cortex7"},
         ],
@@ -144,19 +172,12 @@ CONFIG: Dict[str, Any] = {
             {"id": "anom_detect_B", "node": "nodeB", "module": "cortex7"},
             {"id": "anom_alert_C", "node": "nodeC", "module": "cortex7"},
         ],
-
-        # 8. Symbol / Language Region (text → spikes → text)
-        "Region_Symbol": [
-            {"id": "sym_in_A", "node": "nodeA", "module": "cortex7"},
-            {"id": "sym_hidden_B", "node": "nodeB", "module": "cortex7"},
-            {"id": "sym_out_C", "node": "nodeC", "module": "cortex7"},
-        ],
     },
     "mesocortex_controllers": [
         {
             "node": "nodeA",
             "module_name": "mesocortex_main",
-            # Controller manages all regions (base + experiments + symbol)
+            # Controller manages all regions (base + experiments)
             "regions": [
                 "Region_AB",
                 "Region_BC",
@@ -167,7 +188,6 @@ CONFIG: Dict[str, Any] = {
                 "Region_Flock",
                 "Region_Seq",
                 "Region_Anomaly",
-                "Region_Symbol",
             ],
         }
     ],
@@ -189,7 +209,7 @@ CONFIG: Dict[str, Any] = {
             "interval_s": 0.5,
             "args": {},
         },
-        # NOTE: experiment jobs are not auto-run here; trigger them via control_port or run_all_experiments.
+        # NOTE: experiment jobs are not auto-run here; trigger them via control_port instead.
     ],
     # Shared secret for HMAC signing of mesh envelopes
     "cluster_secret": "p3p_cluster_demo_secret_01",
@@ -319,12 +339,7 @@ class LoggerModule(BaseModule):
         print(f"[{self.runtime.node_id}::{self.name}] logger online")
 
     async def on_message(self, msg: Message):
-        if msg.kind == "log":
-            print(f"[{self.runtime.node_id}::{self.name}] got log from {msg.src}: {msg.payload}")
-        elif msg.kind == "cortex_spike":
-            print(f"[{self.runtime.node_id}::{self.name}] got cortex_spike from {msg.src}: {msg.payload}")
-        elif msg.kind == "cortex_state":
-            print(f"[{self.runtime.node_id}::{self.name}] got cortex_state from {msg.src}: {msg.payload}")
+        print(f"[{self.runtime.node_id}::{self.name}] got {msg.kind} from {msg.src}: {msg.payload}")
 
 
 class EchoModule(BaseModule):
@@ -546,7 +561,7 @@ class NetworkMeshModule(BaseModule):
 
 
 # =========================
-# CORTEX-7 Core
+# CORTEX-7 Core (with reward + baseline + noise)
 # =========================
 
 @dataclass
@@ -574,7 +589,15 @@ class Cortex7Core:
         self.incoming: Dict[int, List[Synapse]] = {i: [] for i in range(n_neurons)}
         self.leak = 0.95
         self.stdplast_params = {"a_plus": 0.01, "a_minus": 0.012, "tau": 20.0}
-        self.reward_level: float = 0.0  # global dopamine-like signal
+        # Reward / dopamine level (cluster-wide broadcast via control)
+        self.reward_level: float = 0.0
+
+    # ----- Reward -----
+
+    def set_reward_level(self, value: float):
+        self.reward_level = float(value)
+
+    # ----- Structure / parameters -----
 
     def set_threshold(self, n: int, thr: float):
         self.neurons[n].threshold = thr
@@ -596,8 +619,7 @@ class Cortex7Core:
     def add_current(self, n: int, current: float):
         self.neurons[n].v += current
 
-    def set_reward_level(self, value: float):
-        self.reward_level = float(value)
+    # ----- Plasticity -----
 
     def _stdp_update(self, syn: Synapse):
         pre_n = self.neurons[syn.pre]
@@ -612,19 +634,29 @@ class Cortex7Core:
         else:
             dw = -a_minus * math.exp(dt / tau)
 
-        # Global reward modulation: reward_level in [-1, +∞)
-        reward_gain = max(0.0, 1.0 + self.reward_level)
+        # Reward modulation: dopamine amplifies or suppresses STDP
+        # reward_level > 0: potentiation dominates
+        # reward_level < 0: depression dominates (or clamps)
+        reward_gain = max(0.0, 1.0 + 2.0 * self.reward_level)
         dw *= reward_gain
 
         syn.w += dw
         syn.w = max(-2.0, min(2.0, syn.w))
         syn.last_update_t = self.t
 
+    # ----- Dynamics -----
+
     def step(self) -> List[int]:
-        for n in self.neurons.values():
+        # Leak, baseline drive, and slight noise
+        for idx, n in self.neurons.items():
             n.v *= self.leak
+            # tiny baseline current so v doesn't sit at exactly 0
+            n.v += 0.01
+            # very small noise so identical neurons diverge
+            n.v += random.uniform(-0.005, 0.005)
 
         spiked: List[int] = []
+        # Threshold / spiking
         for idx, n in self.neurons.items():
             if n.v >= n.threshold:
                 n.v = 0.0
@@ -632,6 +664,7 @@ class Cortex7Core:
                 n.last_spike_t = self.t
                 spiked.append(idx)
 
+        # Propagate spikes, update synapses with STDP
         for pre_idx in spiked:
             for s in self.outgoing.get(pre_idx, []):
                 self.neurons[s.post].v += s.w
@@ -647,6 +680,8 @@ class Cortex7Core:
             for n_idx in sp:
                 all_spikes.append((n_idx, self.t - 1))
         return all_spikes
+
+    # ----- Serialization -----
 
     def dump_state(self) -> Dict[str, Any]:
         return {
@@ -729,7 +764,7 @@ class Cortex7Core:
 
 
 # =========================
-# Cortex7 Module (cluster-wide metrics aware + reward_global)
+# Cortex7 Module (cluster-wide metrics aware + reward + threshold control)
 # =========================
 
 class Cortex7Module(BaseModule):
@@ -742,13 +777,27 @@ class Cortex7Module(BaseModule):
     ):
         super().__init__(name)
         self.core = Cortex7Core(n_neurons=n_neurons)
+
+        # Default thresholds and synapses (now a bit richer)
+        # You can override via debug_low_thresholds.
         self.core.set_threshold(0, 1.0)
         self.core.set_threshold(1, 1.2)
         self.core.set_threshold(2, 1.3)
         self.core.set_threshold(3, 1.5)
+
+        # Forward chain
         self.core.link(0, 1, 0.6)
         self.core.link(1, 2, 0.5)
         self.core.link(2, 3, 0.4)
+        # Mild feedback (for oscillations)
+        self.core.link(1, 0, 0.2)
+        self.core.link(2, 1, 0.15)
+        self.core.link(3, 2, 0.1)
+        # Tiny self-recurrent loops
+        self.core.link(0, 0, 0.05)
+        self.core.link(1, 1, 0.05)
+        self.core.link(2, 2, 0.05)
+        self.core.link(3, 3, 0.05)
 
         self.has_local_metrics = has_local_metrics
         self.remote_metrics_node = remote_metrics_node
@@ -857,13 +906,22 @@ class Cortex7Module(BaseModule):
             value = float(msg.payload.get("value", 0.0))
             self.core.set_reward_level(value)
             await self.emit("logger", "log", {
-                "cortex7": "reward_updated",
+                "cortex7": "reward_level_set",
                 "value": value,
+            })
+
+        elif msg.kind == "set_thresholds":
+            thr = float(msg.payload.get("threshold", 0.4))
+            for idx in list(self.core.neurons.keys()):
+                self.core.set_threshold(idx, thr)
+            await self.emit("logger", "log", {
+                "cortex7": "thresholds_set",
+                "threshold": thr,
             })
 
 
 # =========================
-# Mesocortex Module (tagging region)
+# Mesocortex Module (tagging region + pattern_len handling)
 # =========================
 
 class MesocortexModule(BaseModule):
@@ -897,28 +955,34 @@ class MesocortexModule(BaseModule):
             region = msg.payload.get("region")
             pattern = msg.payload.get("pattern", [])
             cols = self.regions.get(region, [])
+            pattern_len = int(msg.payload.get("pattern_len", 1))
+            if pattern_len < 1:
+                pattern_len = 1
 
             await self.emit("logger", "log", {
                 "mesocortex": "stimulate_region",
                 "region": region,
                 "columns": [c["id"] for c in cols],
-                "pattern_len": len(pattern),
+                "pattern_base_len": len(pattern),
+                "pattern_len": pattern_len,  # effective duration
             })
 
+            # Effective duration: inject the pattern multiple steps
             for col in cols:
-                for p in pattern:
-                    payload = {
-                        "neuron": int(p.get("neuron", 0)),
-                        "current": float(p.get("current", 0.0)),
-                        "region": region,
-                    }
-                    await self._send_to_column(col, "inject", payload)
+                for _ in range(pattern_len):
+                    for p in pattern:
+                        payload = {
+                            "neuron": int(p.get("neuron", 0)),
+                            "current": float(p.get("current", 0.0)),
+                            "region": region,
+                        }
+                        await self._send_to_column(col, "inject", payload)
 
         elif msg.kind == "advance_all":
             ticks = int(msg.payload.get("ticks", 1))
             for region, cols in self.regions.items():
                 for col in cols:
-                    await self._send_to_column(col, "advance", {"ticks": ticks, "region": region})
+                    await self._send_to_column(col, "advance", {"ticks": ticks})
             await self.emit("logger", "log", {
                 "mesocortex": "advance_all",
                 "ticks": ticks,
@@ -927,7 +991,7 @@ class MesocortexModule(BaseModule):
         elif msg.kind == "dump_all":
             for region, cols in self.regions.items():
                 for col in cols:
-                    await self._send_to_column(col, "dump", {"region": region})
+                    await self._send_to_column(col, "dump", {})
             await self.emit("logger", "log", {
                 "mesocortex": "dump_all",
             })
@@ -1092,13 +1156,9 @@ class ControlPlaneModule(BaseModule):
     Supported commands:
       - 'status'
       - 'run_demo'
-      - 'run_all_experiments'
       - 'update_regions'
       - 'snapshot'
       - 'load_snapshot'
-      - 'reward'
-      - 'camera_inject_pattern'
-      - 'symbol_prompt'
       - 'experiment_pattern_classify'
       - 'experiment_rhythm_gen'
       - 'experiment_hopfield_assoc'
@@ -1106,6 +1166,8 @@ class ControlPlaneModule(BaseModule):
       - 'experiment_boid_swarm'
       - 'experiment_seq_gen'
       - 'experiment_seizure_detect'
+      - 'reward_global'          (reward/dopamine broadcast)
+      - 'debug_low_thresholds'   (cluster-wide threshold override)
     """
 
     def __init__(self, name: str, config: Dict[str, Any]):
@@ -1126,26 +1188,12 @@ class ControlPlaneModule(BaseModule):
             await self._cmd_status(args)
         elif cmd == "run_demo":
             await self._cmd_run_demo(args)
-        elif cmd == "run_all_experiments":
-            await self._cmd_run_all_experiments(args)
         elif cmd == "update_regions":
             await self._cmd_update_regions(args)
         elif cmd == "snapshot":
             await self._cmd_snapshot(args)
         elif cmd == "load_snapshot":
             await self._cmd_load_snapshot(args)
-
-        # Reward
-        elif cmd == "reward":
-            await self._cmd_reward(args)
-
-        # Camera → Region_Pattern
-        elif cmd == "camera_inject_pattern":
-            await self._cmd_camera_inject_pattern(args)
-
-        # Symbol / language
-        elif cmd == "symbol_prompt":
-            await self._cmd_symbol_prompt(args)
 
         # Experiment suite
         elif cmd == "experiment_pattern_classify":
@@ -1162,6 +1210,12 @@ class ControlPlaneModule(BaseModule):
             await self._cmd_experiment_seq_gen(args)
         elif cmd == "experiment_seizure_detect":
             await self._cmd_experiment_seizure_detect(args)
+
+        # Reward & debug
+        elif cmd == "reward_global":
+            await self._cmd_reward_global(args)
+        elif cmd == "debug_low_thresholds":
+            await self._cmd_debug_low_thresholds(args)
 
         else:
             await self.emit("logger", "log", {
@@ -1211,6 +1265,7 @@ class ControlPlaneModule(BaseModule):
                     {
                         "region": region,
                         "pattern": [{"neuron": 0, "current": 0.7}],
+                        "pattern_len": 3,  # a bit more stimulation by default
                     },
                 )
             await asyncio.sleep(0.05)
@@ -1302,132 +1357,91 @@ class ControlPlaneModule(BaseModule):
             "args": args,
         })
 
-    # ----- Reward helpers -----
+    # ----- Reward (dopamine) -----
 
-    async def _broadcast_reward(self, value: float):
-        # Local cortex
+    async def _cmd_reward_global(self, args: Dict[str, Any]):
+        """
+        Broadcast a reward (dopamine) level cluster-wide.
+
+        Example:
+          {"cmd": "reward_global", "args": {"value": +1.0}}
+          {"cmd": "reward_global", "args": {"value": -0.5}}
+        """
+        value = float(args.get("value", 0.0))
+        nodes = self.config.get("nodes", [])
+
+        # Local cortex first
         if "cortex7" in self.runtime.modules:
             await self.emit("cortex7", "reward_global", {"value": value})
 
         # Remote cortex modules via mesh
-        nodes = self.config.get("nodes", [])
-        for n in nodes:
-            nid = n["id"]
+        for ndef in nodes:
+            nid = ndef["id"]
             if nid == self.runtime.node_id:
                 continue
-            if "cortex7" in n.get("modules", []):
-                if "mesh" in self.runtime.modules:
-                    await self.emit(
-                        "mesh",
-                        "send_remote",
-                        {
-                            "target_node": nid,
-                            "dest_module": "cortex7",
-                            "remote_kind": "reward_global",
-                            "payload": {"value": value},
-                        },
-                    )
+            if "cortex7" not in ndef.get("modules", []):
+                continue
+
+            if "mesh" not in self.runtime.modules:
+                continue
+
+            await self.emit(
+                "mesh",
+                "send_remote",
+                {
+                    "target_node": nid,
+                    "dest_module": "cortex7",
+                    "remote_kind": "reward_global",
+                    "payload": {"value": value},
+                },
+            )
 
         await self.emit("logger", "log", {
-            "control": "reward_broadcast",
+            "control": "reward_global_broadcast",
             "value": value,
         })
 
-    async def _cmd_reward(self, args: Dict[str, Any]):
-        value = float(args.get("value", 0.0))
-        await self._broadcast_reward(value)
+    # ----- Debug thresholds -----
 
-    # ----- Camera → Region_Pattern -----
+    async def _cmd_debug_low_thresholds(self, args: Dict[str, Any]):
+        """
+        Drop all Cortex7 thresholds cluster-wide to a low value (e.g. 0.4)
+        so you can confirm connectivity and spiking behavior.
 
-    async def _cmd_camera_inject_pattern(self, args: Dict[str, Any]):
-        pattern = args.get("pattern", [])
-        if not isinstance(pattern, list):
-            await self.emit("logger", "log", {
-                "control": "camera_inject_pattern_failed",
-                "reason": "pattern_not_list",
-            })
-            return
+        Example:
+          {"cmd": "debug_low_thresholds", "args": {"threshold": 0.4}}
+        """
+        thr = float(args.get("threshold", 0.4))
+        nodes = self.config.get("nodes", [])
 
-        mname = await self._get_mesocortex_main_name()
-        if not mname:
-            await self.emit("logger", "log", {
-                "control": "camera_inject_pattern_failed",
-                "reason": "no_mesocortex",
-            })
-            return
+        # Local
+        if "cortex7" in self.runtime.modules:
+            await self.emit("cortex7", "set_thresholds", {"threshold": thr})
 
-        await self.emit("logger", "log", {
-            "control": "camera_inject_pattern",
-            "pattern_len": len(pattern),
-        })
+        # Remote
+        for ndef in nodes:
+            nid = ndef["id"]
+            if nid == self.runtime.node_id:
+                continue
+            if "cortex7" not in ndef.get("modules", []):
+                continue
+            if "mesh" not in self.runtime.modules:
+                continue
 
-        await self.emit(
-            mname,
-            "stimulate_region",
-            {
-                "region": "Region_Pattern",
-                "pattern": pattern,
-            },
-        )
-        await self.emit(
-            mname,
-            "advance_all",
-            {"ticks": 1},
-        )
-
-    # ----- Symbol / language -----
-
-    async def _cmd_symbol_prompt(self, args: Dict[str, Any]):
-        text = str(args.get("text", "")).strip()
-        if not text:
-            await self.emit("logger", "log", {
-                "control": "symbol_prompt_failed",
-                "reason": "empty_text",
-            })
-            return
-
-        tokens = text.split()
-        mname = await self._get_mesocortex_main_name()
-        if not mname:
-            await self.emit("logger", "log", {
-                "control": "symbol_prompt_failed",
-                "reason": "no_mesocortex",
-            })
-            return
-
-        await self.emit("logger", "log", {
-            "control": "symbol_prompt_begin",
-            "text": text,
-            "tokens": tokens,
-        })
-
-        for idx, tok in enumerate(tokens):
-            base = 0.3 + 0.05 * (idx % 5)
-            extra = 0.5 if len(tok) % 2 == 0 else 0.7
-            pattern = [
-                {"neuron": 0, "current": base},
-                {"neuron": 1, "current": base * 0.8},
-                {"neuron": 2, "current": extra},
-            ]
-            await self._broadcast_reward(0.2)  # mild positive reward
             await self.emit(
-                mname,
-                "stimulate_region",
+                "mesh",
+                "send_remote",
                 {
-                    "region": "Region_Symbol",
-                    "pattern": pattern,
+                    "target_node": nid,
+                    "dest_module": "cortex7",
+                    "remote_kind": "set_thresholds",
+                    "payload": {"threshold": thr},
                 },
             )
-            await self.emit(
-                mname,
-                "advance_all",
-                {"ticks": 2},
-            )
-            await asyncio.sleep(0.01)
 
         await self.emit("logger", "log", {
-            "control": "symbol_prompt_complete",
-            "tokens": len(tokens),
+            "control": "debug_low_thresholds_sent",
+            "threshold": thr,
         })
 
     # ----- Experiment helpers -----
@@ -1441,6 +1455,7 @@ class ControlPlaneModule(BaseModule):
     # 1. Pattern Replay Classifier (scaffold)
     async def _cmd_experiment_pattern_classify(self, args: Dict[str, Any]):
         epochs = int(args.get("epochs", 10))
+        pattern_len = int(args.get("pattern_len", 8))
         mname = await self._get_mesocortex_main_name()
         if not mname:
             await self.emit("logger", "log", {
@@ -1452,15 +1467,16 @@ class ControlPlaneModule(BaseModule):
         await self.emit("logger", "log", {
             "control": "experiment_pattern_classify_begin",
             "epochs": epochs,
+            "pattern_len": pattern_len,
             "region": "Region_Pattern",
         })
 
         # Four simple patterns on neuron 0/1 to emulate 00/01/10/11-ish rate codes
         patterns = [
-            [{"neuron": 0, "current": 0.3}],                 # pattern 0
-            [{"neuron": 1, "current": 0.3}],                 # pattern 1
-            [{"neuron": 0, "current": 0.5}],                 # pattern 2
-            [{"neuron": 1, "current": 0.5}],                 # pattern 3
+            [{"neuron": 0, "current": 0.6}],  # pattern 0
+            [{"neuron": 1, "current": 0.6}],  # pattern 1
+            [{"neuron": 0, "current": 0.9}],  # pattern 2 (stronger)
+            [{"neuron": 1, "current": 0.9}],  # pattern 3 (stronger)
         ]
 
         for epoch in range(epochs):
@@ -1471,9 +1487,9 @@ class ControlPlaneModule(BaseModule):
                     {
                         "region": "Region_Pattern",
                         "pattern": p,
+                        "pattern_len": pattern_len,
                     },
                 )
-                # short evolution window
                 await asyncio.sleep(0.01)
 
             # Let the region settle
@@ -1501,6 +1517,7 @@ class ControlPlaneModule(BaseModule):
     async def _cmd_experiment_rhythm_gen(self, args: Dict[str, Any]):
         epochs = int(args.get("epochs", 20))
         ticks_per_epoch = int(args.get("ticks_per_epoch", 20))
+        pattern_len = int(args.get("pattern_len", 4))
         mname = await self._get_mesocortex_main_name()
         if not mname:
             await self.emit("logger", "log", {
@@ -1513,6 +1530,7 @@ class ControlPlaneModule(BaseModule):
             "control": "experiment_rhythm_gen_begin",
             "epochs": epochs,
             "ticks_per_epoch": ticks_per_epoch,
+            "pattern_len": pattern_len,
             "region": "Region_Osc",
         })
 
@@ -1523,6 +1541,7 @@ class ControlPlaneModule(BaseModule):
             {
                 "region": "Region_Osc",
                 "pattern": [{"neuron": 0, "current": 1.0}],
+                "pattern_len": pattern_len,
             },
         )
 
@@ -1552,6 +1571,7 @@ class ControlPlaneModule(BaseModule):
     # 3. Associative Memory (scaffold)
     async def _cmd_experiment_hopfield_assoc(self, args: Dict[str, Any]):
         epochs = int(args.get("epochs", 15))
+        pattern_len = int(args.get("pattern_len", 6))
         mname = await self._get_mesocortex_main_name()
         if not mname:
             await self.emit("logger", "log", {
@@ -1563,13 +1583,14 @@ class ControlPlaneModule(BaseModule):
         await self.emit("logger", "log", {
             "control": "experiment_hopfield_assoc_begin",
             "epochs": epochs,
+            "pattern_len": pattern_len,
             "region": "Region_Memory",
         })
 
         base_patterns = [
-            [{"neuron": 0, "current": 0.6}],
-            [{"neuron": 1, "current": 0.6}],
-            [{"neuron": 2, "current": 0.6}],
+            [{"neuron": 0, "current": 0.7}],
+            [{"neuron": 1, "current": 0.7}],
+            [{"neuron": 2, "current": 0.7}],
         ]
 
         for epoch in range(epochs):
@@ -1581,6 +1602,7 @@ class ControlPlaneModule(BaseModule):
                     {
                         "region": "Region_Memory",
                         "pattern": p,
+                        "pattern_len": pattern_len,
                     },
                 )
                 await self.emit(
@@ -1603,6 +1625,7 @@ class ControlPlaneModule(BaseModule):
                     {
                         "region": "Region_Memory",
                         "pattern": noisy,
+                        "pattern_len": pattern_len,
                     },
                 )
                 await self.emit(
@@ -1649,13 +1672,14 @@ class ControlPlaneModule(BaseModule):
         for ep in range(episodes):
             # crude "state" ramp via currents on sensor neuron 0
             for step in range(steps_per_episode):
-                current_level = 0.2 + 0.01 * step
+                current_level = 0.3 + 0.02 * step
                 await self.emit(
                     mname,
                     "stimulate_region",
                     {
                         "region": "Region_Cart",
                         "pattern": [{"neuron": 0, "current": current_level}],
+                        "pattern_len": 2,
                     },
                 )
                 await self.emit(
@@ -1665,6 +1689,7 @@ class ControlPlaneModule(BaseModule):
                 )
                 await asyncio.sleep(0.003)
 
+            # You can call reward_global from outside at this point if the episode "succeeds"
             if ep % 5 == 0:
                 await self.emit(
                     mname,
@@ -1682,6 +1707,7 @@ class ControlPlaneModule(BaseModule):
     # 5. Multi-Agent Coordination / Flocking (scaffold)
     async def _cmd_experiment_boid_swarm(self, args: Dict[str, Any]):
         epochs = int(args.get("epochs", 25))
+        pattern_len = int(args.get("pattern_len", 4))
         mname = await self._get_mesocortex_main_name()
         if not mname:
             await self.emit("logger", "log", {
@@ -1693,13 +1719,14 @@ class ControlPlaneModule(BaseModule):
         await self.emit("logger", "log", {
             "control": "experiment_boid_swarm_begin",
             "epochs": epochs,
+            "pattern_len": pattern_len,
             "region": "Region_Flock",
         })
 
         for epoch in range(epochs):
             # Simulate "neighbors" by alternating currents on different neurons
             pat = []
-            base_current = 0.3 + 0.02 * (epoch % 5)
+            base_current = 0.4 + 0.03 * (epoch % 5)
             pat.append({"neuron": 0, "current": base_current})
             pat.append({"neuron": 1, "current": base_current * 0.9})
 
@@ -1709,6 +1736,7 @@ class ControlPlaneModule(BaseModule):
                 {
                     "region": "Region_Flock",
                     "pattern": pat,
+                    "pattern_len": pattern_len,
                 },
             )
             await self.emit(
@@ -1763,6 +1791,7 @@ class ControlPlaneModule(BaseModule):
                     {
                         "region": "Region_Seq",
                         "pattern": [{"neuron": 0, "current": current}],
+                        "pattern_len": 2,
                     },
                 )
                 await self.emit(
@@ -1807,13 +1836,13 @@ class ControlPlaneModule(BaseModule):
 
         for epoch in range(epochs):
             # "Normal" low-amplitude sine-ish waveform approximated by alternating small currents
-            normal_current = 0.2 + 0.05 * ((epoch % 4) / 3.0)
+            normal_current = 0.25 + 0.05 * ((epoch % 4) / 3.0)
             pattern = [{"neuron": 0, "current": normal_current}]
 
             # Occasionally inject a "burst" as anomaly
             is_burst = (epoch % burst_every) == 0
             if is_burst:
-                pattern.append({"neuron": 1, "current": 1.0})
+                pattern.append({"neuron": 1, "current": 1.1})
 
             await self.emit(
                 mname,
@@ -1821,6 +1850,7 @@ class ControlPlaneModule(BaseModule):
                 {
                     "region": "Region_Anomaly",
                     "pattern": pattern,
+                    "pattern_len": 3,
                 },
             )
             await self.emit(
@@ -1844,25 +1874,6 @@ class ControlPlaneModule(BaseModule):
         await self.emit("logger", "log", {
             "control": "experiment_seizure_detect_complete",
             "epochs": epochs,
-        })
-
-    # ----- Run all experiments -----
-
-    async def _cmd_run_all_experiments(self, args: Dict[str, Any]):
-        await self.emit("logger", "log", {
-            "control": "run_all_experiments_begin",
-        })
-
-        await self._cmd_experiment_pattern_classify({})
-        await self._cmd_experiment_rhythm_gen({})
-        await self._cmd_experiment_hopfield_assoc({})
-        await self._cmd_experiment_cart_balance({})
-        await self._cmd_experiment_boid_swarm({})
-        await self._cmd_experiment_seq_gen({})
-        await self._cmd_experiment_seizure_detect({})
-
-        await self.emit("logger", "log", {
-            "control": "run_all_experiments_complete",
         })
 
 
@@ -1955,8 +1966,8 @@ class ControlPortModule(BaseModule):
         {"cmd": "status", "args": {}}
         {"cmd": "run_demo", "args": {"stim_cycles": 3}}
         {"cmd": "experiment_pattern_classify", "args": {"epochs": 20}}
-        {"cmd": "reward", "args": {"value": 0.5}}
-        {"cmd": "camera_inject_pattern", "args": {"pattern": [...]}}
+        {"cmd": "reward_global", "args": {"value": 1.0}}
+        {"cmd": "debug_low_thresholds", "args": {"threshold": 0.4}}
 
     For each valid line, forwards into local ControlPlaneModule.
     """
@@ -2029,40 +2040,6 @@ def build_peer_maps(config: Dict[str, Any]) -> Dict[str, Dict[str, tuple]]:
             peers[nid2] = (host, port2)
         peers_map[nid] = peers
     return peers_map
-
-
-# =========================
-# Cluster Scaler
-# =========================
-
-def build_scaled_config(base_config: Dict[str, Any], total_nodes: int) -> Dict[str, Any]:
-    """
-    Return a config with total_nodes nodes.
-    Nodes A/B/C are preserved; extra nodes are cortex+mesh satellites.
-    """
-    if total_nodes <= len(base_config["nodes"]):
-        return base_config
-
-    cfg = copy.deepcopy(base_config)
-    existing = len(cfg["nodes"])
-    max_port = max(n["port"] for n in cfg["nodes"])
-
-    # Node ids: nodeA, nodeB, nodeC, nodeD, ...
-    for idx in range(existing, total_nodes):
-        letter_ord = ord("A") + idx
-        if letter_ord <= ord("Z"):
-            nid_suffix = chr(letter_ord)
-        else:
-            nid_suffix = f"X{idx}"
-        node_id = f"node{nid_suffix}"
-        max_port += 1
-        cfg["nodes"].append({
-            "id": node_id,
-            "port": max_port,
-            "modules": ["logger", "echo", "cortex7", "mesh"],
-        })
-
-    return cfg
 
 
 # =========================
@@ -2180,18 +2157,6 @@ async def run_cluster(config: Dict[str, Any]):
         )
         await asyncio.sleep(0.3)
 
-    # Run full experiment suite
-    if "nodeA" in nodes and "control" in nodes["nodeA"].modules:
-        print("\n=== Control: run_all_experiments on nodeA ===")
-        await nodes["nodeA"].emit(
-            src="tester_control",
-            dest="control",
-            kind="control",
-            payload={"cmd": "run_all_experiments", "args": {}},
-        )
-        # Allow experiments to run
-        await asyncio.sleep(10.0)
-
     # Gather metrics summary and dict
     summary_text = None
     metrics_dict: Optional[Dict[str, Any]] = None
@@ -2221,97 +2186,8 @@ async def run_cluster(config: Dict[str, Any]):
 
 
 # =========================
-# Camera Client (CLI mode)
+# Entry
 # =========================
-
-def run_camera_client(camera_url: str, host: str = "127.0.0.1", port: int = 10080):
-    """
-    Simple loop:
-      - open camera with OpenCV
-      - compute brightness + motion
-      - send camera_inject_pattern commands into control_port
-    """
-    try:
-        import cv2  # type: ignore
-    except ImportError:
-        print("[camera] OpenCV (cv2) not installed. Install with: pip install opencv-python")
-        return
-
-    if camera_url == "0":
-        cam_index = 0
-        cap = cv2.VideoCapture(cam_index)
-    else:
-        cap = cv2.VideoCapture(camera_url)
-
-    if not cap.isOpened():
-        print(f"[camera] failed to open camera: {camera_url}")
-        return
-
-    print(f"[camera] streaming from {camera_url} → {host}:{port}")
-    prev_gray = None
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame_small = cv2.resize(frame, (16, 16))
-            gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
-            brightness = float(gray.mean()) / 255.0
-
-            if prev_gray is None:
-                motion = 0.0
-            else:
-                diff = cv2.absdiff(gray, prev_gray)
-                motion = float(diff.mean()) / 255.0
-            prev_gray = gray
-
-            brightness = max(0.0, min(1.0, brightness))
-            motion = max(0.0, min(1.0, motion))
-
-            pattern = [
-                {"neuron": 0, "current": 0.2 + 0.8 * brightness},
-                {"neuron": 1, "current": 0.2 + 0.8 * motion},
-            ]
-
-            cmd = {"cmd": "camera_inject_pattern", "args": {"pattern": pattern}}
-            line = (json.dumps(cmd) + "\n").encode("utf-8")
-
-            try:
-                with socket.create_connection((host, port), timeout=1.0) as sock:
-                    sock.sendall(line)
-            except OSError:
-                # control_port not available yet; skip silently
-                pass
-
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
-                break
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        print("[camera] stopped")
-
-
-# =========================
-# Entry / CLI
-# =========================
-
-def main():
-    parser = argparse.ArgumentParser(description="P3P Core v6 — cluster + camera + control_port")
-    parser.add_argument("--mode", choices=["cluster", "camera"], default="cluster", help="cluster: run nodes, camera: feed Region_Pattern")
-    parser.add_argument("--nodes", type=int, default=3, help="total nodes in cluster (cluster mode)")
-    parser.add_argument("--camera-url", default="0", help="camera index or URL (camera mode)")
-    args = parser.parse_args()
-
-    if args.mode == "cluster":
-        cfg = CONFIG
-        if args.nodes > len(CONFIG["nodes"]):
-            cfg = build_scaled_config(CONFIG, args.nodes)
-        asyncio.run(run_cluster(cfg))
-    elif args.mode == "camera":
-        run_camera_client(args.camera_url, CONFIG["listen_host"], CONFIG.get("control_port", 10080))
-
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run_cluster(CONFIG))
